@@ -1,0 +1,1223 @@
+\documentclass{article}
+%\documentclass[12pt, legno]{article}
+
+\usepackage[doublespacing]{setspace}
+\usepackage[utf8]{inputenc} 
+\usepackage{graphics}
+\usepackage[english]{babel}\selectlanguage{english}
+\usepackage{float} %table repositioning
+\usepackage{mathtools}
+%\restylefloat{table}
+\usepackage{caption} 
+\captionsetup[table]{skip=10pt} %space between caption and table
+%\captionsetup{singlelinecheck = false} %deactivate centered captions
+\usepackage{booktabs} % ein Paket zum setzen von qualitativ hochwertigen horizontalen Strichen in Tabellen
+\usepackage{tabularx}
+\usepackage[authoryear]{natbib}
+\bibpunct{(}{)}{;}{a}{,}{,}
+\usepackage{dcolumn}
+\usepackage{rotating}
+\usepackage{appendix}
+\usepackage{longtable}
+\usepackage{geometry}
+\usepackage{endnotes}
+\usepackage{amsthm}
+\usepackage{chbibref}
+\usepackage{indentfirst}
+\usepackage{hyperref}
+%\usepackage[backend=bibtex, sorting=none]{biblatex}
+%\usepackage{sw55aer}
+
+% the following two packages necessary to display ">" or "<" signs in tables created with kable
+% from https://tex.stackexchange.com/questions/252119/knitr-less-greater-than-sign-displayed-as-and
+\usepackage{lmodern}
+\usepackage[T1]{fontenc} 
+
+%solution taken from https://stackoverflow.com/questions/26003574/dplyr-mutate-use-dynamic-variable-names
+%https://www.r-bloggers.com/converting-a-string-to-a-variable-name-on-the-fly-and-vice-versa-in-r/
+
+\makeatletter
+\let\@fnsymbol\@arabic
+\makeatother
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% MARGINS
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\oddsidemargin 0.0cm \topmargin -2.0cm \textwidth 16 cm \textheight 24.0cm 
+
+\renewcommand\floatpagefraction{.99}
+\renewcommand\topfraction{.99}
+\renewcommand\bottomfraction{.99}
+\renewcommand\textfraction{.01}
+
+\renewcommand{\baselinestretch}{1.5}
+
+\begin{document}
+%\SweaveOpts{concordance=TRUE}
+
+  
+\title{GPS (SANDBOX) in R-PACKAGE}
+\date{\today}
+    
+\maketitle
+
+This is an attempt to replicate the analysis of the lottery winners dataset in \citet{HiranoImbens2004}. The data were downloaded from \url{https://econpapers.repec.org/software/bocbocode/s457096.htm} with STATA codes of \citet{BiaMattei2008}. The data link is \url{https://econpapers.repec.org/scripts/redir.pf?u=http%3A%2F%2Ffmwww.bc.edu%2Frepec%2Fbocode%2Fl%2FLotteryDataSet.dta;h=repec:boc:bocode:s457096.}  
+  
+  
+
+<<setup, include=FALSE, cache=FALSE, echo = FALSE>>=
+cat("\014")  
+rm(list=ls(all=TRUE))
+
+#Sys.setenv(PATH = paste(Sys.getenv("PATH"), "C:\\MiKTeX 2.9\\miktex\\bin\\x64", sep=.Platform$path.sep))
+
+Sys.setlocale("LC_ALL","English")
+#Sys.setlocale("LC_TIME", "en_US")
+library( knitr       )
+library( xtable      )
+library( stargazer   )
+library( readstata13 )
+library( lubridate   ) 
+library( tfplot      )
+library( readxl      )
+library( magrittr    )
+library( tstools     )
+library( tempdisagg  )
+library( downloader  )
+library( RPostgreSQL )
+library( seasonal    )
+library( dplyr       )
+library( tidyr       ) # replace_na
+library( stringr     )
+library( kableExtra  )
+library( tibble      ) 
+library( R.utils     )
+library( ggfortify   )
+library( broom       )
+library( changepoint )
+library( strucchange )
+library( ggpmisc     )
+library( gridExtra   )
+library( grid        )
+library( causaldrf   )
+library( lmtest      )
+library( purrr       )  # functional programming
+library( ggplot2     )  # plotting
+library( simpleboot  )
+require( reshape2    )  # melt command
+
+#set global chunk options: to be done, echo always FALSE?
+opts_knit$set(root.dir='../') #working directory, does not work without this
+#options(digits = 4) # works for figures in text, does not work for xtable
+opts_chunk$set(fig.width = 13) #fig.align = "center", out.width = '0.9\\textwidth', 
+knitr::opts_chunk$set( fig.path = 'figures/' )
+knitr::opts_chunk$set( echo = FALSE, warning = FALSE, message = FALSE)
+# f <- function(x, options) {
+#   lab <- paste0(options$fig.lp, options$label)
+#   paste("\\end{kframe}\n", 
+#         "\\begin{figure}\n\\caption{", options$capT, "}\\label{", lab,"}\n", 
+#         hook_plot_tex(x, options), 
+#         "\\end{figure}\n\n\\begin{kframe}", sep = "")
+# }
+# knit_hooks$set(plot = f)
+@
+  
+<<functions, include=FALSE, cache=FALSE, echo = FALSE>>=  
+compute_gps = function( y, fit, sigma ){
+### compute GPS for individual unit i
+### input: y_i - scalar, value of treatment
+###        fit_i - scalar, fitted value from step 1
+###        sigma - scalar, regression standard error from step 1
+    return( exp( -( y - fit )**2 / ( 2 * sigma**2 ) ) / ( sqrt( 2 * pi ) * sigma ) )
+}
+compute_gps_from_ols = function( ols ){
+### input: ols object from lm  
+  # use max lik estimator for the regression standard error, sigma
+
+  ### extract regression standard error
+  sigma = sqrt( deviance( ols )/( df.residual( ols ) + ols$qr$rank ) )
+  ### compute GPS
+  return( list( gps = dnorm( ols$residuals, mean = 0, sd = sigma ), sigma = sigma ) )
+}
+func_set_regression_dose   = function( opt ){
+  
+  ### check whether to add constant 
+  add_incpt = ifelse( opt$ols_dose_add_incpt, "~incpt-1+", "~" )
+  sx = opt$ols_dose  
+  sFormula = paste( opt$varname_dose , paste(sx, collapse = "+"), sep= add_incpt ) %>% as.formula; sFormula
+
+}
+func_set_regression_resp   = function( opt ){
+  
+  ### check whether to add constant 
+  add_incpt = ifelse( opt$ols_resp_add_incpt, "~incpt-1+", "~" )
+  sx = opt$ols_resp  
+  sFormula = paste( opt$varname_resp, paste(sx, collapse = "+"), sep= add_incpt ) %>% as.formula; sFormula
+}
+
+func_check_covariate_balance_init = function( opt, db_coba, sVars2test ){
+### check whether mean of each covariate in one treatment group is different 
+### from its mean in other treatment groups combined
+    ### create indicator that assigns covariates to treatment groups
+    db_coba %<>% mutate( id_dose_group = cut( eval( parse( text = opt$varname_dose_orig ) ), include.lowest = T, labels=1:opt$dose_group_num, breaks = opt$dose_group_breaks ) )
+    
+    tbl_nobs = db_coba %>% group_by( id_dose_group ) %>%
+                summarize( nobs = n() ) 
+    
+    sum_two_sample_t_test = lapply( seq(1:opt$dose_group_num), function( dose_group_k ){  # dose_group_k = 1
+      
+        db_coba %<>% mutate( flag_group_k = if_else( id_dose_group == dose_group_k, TRUE, FALSE ) )
+      
+        db_in_k = db_coba %>% filter( flag_group_k == TRUE  )
+        db_ud_k = db_coba %>% filter( flag_group_k == FALSE )
+        
+        sExp_var_in_mu = db_in_k %>% summarise_at( .vars = sVars2test, .funs = c( mean="mean" ) )
+        sExp_var_ud_mu = db_ud_k %>% summarise_at( .vars = sVars2test, .funs = c( mean="mean" ) )
+        
+        sExp_var_in_sd = db_in_k %>% summarise_at( .vars = sVars2test, .funs = c( sd="sd" ) )
+        sExp_var_ud_sd = db_ud_k %>% summarise_at( .vars = sVars2test, .funs = c( sd="sd" ) )
+        
+        alle_mu = rbind( sExp_var_in_mu, sExp_var_ud_mu, sExp_var_in_mu - sExp_var_ud_mu ) %>% t %>% 
+              set_colnames( c(dose_group_k, paste0("~",dose_group_k), "diff" ) ) %>% set_rownames( sVars2test )
+        
+        alle_sd = rbind( sExp_var_in_sd, sExp_var_ud_sd, sExp_var_in_sd - sExp_var_ud_sd ) %>% t %>% 
+              set_colnames( c(dose_group_k, paste0("~",dose_group_k), "diff" ) ) %>% set_rownames( sVars2test )
+        
+    
+        ### map function example taken from https://sebastiansauer.github.io/looping-purrr/
+        ### Looping through dataframe columns using purrr::map()
+        
+        db2pval = db_coba %>%
+          select( sVars2test ) %>%
+          map( function( x ) t.test( as.formula( "x ~ db_coba$flag_group_k" ), var.equal = FALSE)$p.value ) %>% 
+          as.data.frame %>% 
+          gather %>% 
+          mutate(signif = ifelse(value < .05, "<0.05", ">0.05"))
+        
+        db2tstat = db_coba %>%
+          select( sVars2test ) %>%
+          map( function( x ) t.test( as.formula( "x ~ db_coba$flag_group_k" ), var.equal = FALSE)$statistic ) %>% 
+          as.data.frame %>% 
+          gather %>% column_to_rownames( "key" )
+    
+        db_coba %<>% select( -flag_group_k )
+        
+        list( pval = db2pval, tstat = db2tstat, diff_mu = alle_mu, diff_sd = alle_sd )
+    } ) %>% set_names( opt$dose_group_names )
+    
+    tbl_tstat    = do.call( cbind, lapply(sum_two_sample_t_test, '[[', "tstat" ) ) %>% set_colnames( opt$dose_group_names )
+    tbl_pval     = do.call( cbind, lapply(sum_two_sample_t_test, '[[', "pval") )
+    tbl_diff_mu  = do.call( cbind, lapply(sum_two_sample_t_test, '[[', "diff_mu") )
+    tbl_diff_sd  = do.call( cbind, lapply(sum_two_sample_t_test, '[[', "diff_sd") )
+    
+    list( tbl_nobs = tbl_nobs, tbl_tstat = tbl_tstat, tbl_pval = tbl_pval, tbl_diff_mu = tbl_diff_mu, tbl_diff_sd = tbl_diff_sd )
+}
+func_check_covariate_balance_agps = function( opt, db_coba, sVars2test){ # db_coba = db_dose
+
+      db_coba %<>% mutate( id_dose_group = cut( eval( parse( text = opt$varname_dose_orig ) ), include.lowest = T, labels=1:opt$dose_group_num, breaks = opt$dose_group_breaks ) )
+          
+      ### loop over dose_groups 
+      coba_agps_sum = lapply( seq(1:opt$dose_group_num), function( dose_group_k ) { # dose_group_k = 1
+      
+          ### compute median dose for dose_group_k: med_dose_group_k
+          med_dose_group_k = db_coba %>% 
+                             filter( id_dose_group == dose_group_k ) %>% 
+                             summarise_at( .vars = opt$varname_dose, .funs = median ) %>% unlist
+      
+          db_coba_k = db_coba %>%  mutate( med_dose_group_k = med_dose_group_k ) 
+          
+          ### compute GPS at med_dose_group_k for all entries
+          db_coba_k %<>% mutate( gps_at_med_dose_group_k = compute_gps( med_dose_group_k, fit, sigma ) )
+          
+          gps_quantile = db_coba_k %>% filter( id_dose_group == dose_group_k ) %>% 
+                   summarise( list( quantile( gps_at_med_dose_group_k, probs = seq( 0, 1, by = 1/opt$M ) ) ) )%>%
+                   map_df(unlist) %>% pull(1) # pull converts tibble to vector
+          
+          gps_range = db_coba_k %>% summarize( min = min( gps_at_med_dose_group_k ), max = max( gps_at_med_dose_group_k ) ); gps_range  
+          
+          gps_quantile[1]   = min( gps_quantile[1]  , min( gps_range ), 0 )
+          gps_quantile[opt$M+1] = max( gps_quantile[ opt$M+1], max( gps_range ) )
+          gps_quantile
+          
+          
+          gps_intervals = rbind( head( gps_quantile, n = -1 ), gps_quantile[-1] ) %>% apply( ., 2, as.list )
+      
+          ### collect test summary over all M for a chosen group k
+          sum_test_group_k = lapply( seq(1,opt$M), function( m ) { #m = 1 
+          
+              db_k_in = db_coba_k %>% filter( id_dose_group == dose_group_k & gps_at_med_dose_group_k > gps_intervals[[m]][[1]] & gps_at_med_dose_group_k <= gps_intervals[[m]][[2]] ) 
+              
+              db_k_ud = db_coba_k %>% filter( id_dose_group != dose_group_k & gps_at_med_dose_group_k > gps_intervals[[m]][[1]] & gps_at_med_dose_group_k <= gps_intervals[[m]][[2]] ) 
+              db_k_m = rbind( db_k_in, db_k_ud ) %>%
+                       mutate( flag_group_k = if_else( id_dose_group == dose_group_k, TRUE, FALSE ) )
+              
+              
+              mean_db_k_m = db_k_m %>% group_by( flag_group_k ) %>% summarise_at( .vars = sVars2test, .funs = c( "mean" ) )
+              
+              diff = unlist( mean_db_k_m[1,  ] )[-1] - unlist( mean_db_k_m[2,  ] )[-1]; diff
+              
+              ### remove those that have zero difference
+              diff_zero_names = names(diff)[ which( diff == 0 ) ]
+              if( length( diff_zero_names ) > 0 ){
+                
+                sum_test_m_zero = as_tibble( matrix( 0, ncol = 4, nrow = length( diff_zero_names ) ) ) %>% 
+                                  set_colnames( c( "key", "tstat","diff", "se") ) %>%
+                                  mutate( key = diff_zero_names )
+                sum_test_m_zero
+              }
+              
+              
+              ### remove those variables w/o difference in means
+              if( length( diff_zero_names ) > 0 ){
+                sVars2test_test = sVars2test[ -which( diff == 0 ) ]
+              }else{
+                sVars2test_test = sVars2test
+              } 
+              
+              ### do test for those columns where means are different
+              tstat = db_k_m %>%
+                    select( sVars2test_test ) %>%
+                    map( function( x ) t.test( x ~ db_k_m$flag_group_k, var.equal = FALSE)$statistic ) %>% 
+                    as.data.frame %>% 
+                    gather %>% set_colnames( c( "key","tstat") )
+              
+              tstat
+              
+              if( length( diff_zero_names ) > 0 ){
+                sum_test_m = tstat %>% mutate( diff = diff[ -which( diff == 0 )] ) 
+              }else{
+                sum_test_m = tstat %>% mutate( diff = diff )
+              }
+              ### derive se from reported test
+              sum_test_m %<>% mutate( se = diff / tstat )
+              
+              
+              ### add variables with zero difference in mean if they are present   
+              if(length( diff_zero_names ) > 0) sum_test_m %<>% bind_rows( sum_test_m_zero )
+              
+              
+              nobs   = db_k_m %>% summarize( n() ) %>% as.numeric( nobs )
+              nobs_k = db_k_m %>% filter( flag_group_k == TRUE) %>% summarize( n() ) %>% as.numeric( nobs )
+              nobs_j = db_k_m %>% filter( flag_group_k == FALSE) %>% summarize( n() ) %>% as.numeric( nobs )
+              
+              sum_test_m %<>% mutate( nobs = nobs, nobs_k = nobs_k, nobs_j = nobs_j ) %>% column_to_rownames( var = "key" )  %>%
+                             .[ sVars2test,  ]
+              sum_test_m
+          
+          })
+          
+          nobs_group_k_by_m   = do.call( cbind, lapply( sum_test_group_k, `[[`, "nobs"  ) )[ 1, ]; nobs_group_k_by_m
+          nobs_group_k_by_m_k = do.call( cbind, lapply( sum_test_group_k, `[[`, "nobs_k") )[ 1, ]; nobs_group_k_by_m_k
+          nobs_group_k_by_m_j = do.call( cbind, lapply( sum_test_group_k, `[[`, "nobs_j") )[ 1, ]; nobs_group_k_by_m_j
+          
+          df_nobs = data.frame( nobs_group_k_by_m   = nobs_group_k_by_m, 
+                                nobs_group_k_by_m_k = nobs_group_k_by_m_k, 
+                                nobs_group_k_by_m_j = nobs_group_k_by_m_j ) %>%
+                                set_rownames( paste( "m(GPS) =", seq(1,opt$M) ) ) 
+          
+          ### OPTION 1: ### BEG ### COMPUTE WEIGHTED T-STAT BY BLAND/KERRY (1998)
+          ### COMPUTE WEIGHTED MEAN AND ITS STANDARD DEVIATION
+          ### USING BLOCK-SPECIFIC MEANS
+          diff_in_mean_by_m = do.call( cbind, lapply( sum_test_group_k, `[[`, "diff") ) %>% 
+            as.data.frame %>% 
+            set_rownames( rownames( sum_test_group_k[[1]] ) ) %>% 
+            t %>% 
+            as.data.frame %>% 
+            mutate( nobs = df_nobs$nobs_group_k_by_m ) %>%
+            set_rownames( paste( "m(GPS) =", seq(1,opt$M) ) ) 
+          diff_in_mean_by_m
+          
+          ### compute weighted mean across all m = 1,...,M (nobs as weights)
+          diff_in_mean_wght = diff_in_mean_by_m %>% mutate_at( sVars2test, funs( . * nobs ) ) %>% 
+            summarise_all( funs( sum ) ) %>%
+            mutate_at( sVars2test, funs( ./ nobs ) ) %>%
+            mutate( nobs = NULL )
+      
+          ### compute weighted standard deviation from Bland/Kerry(1998)
+          ### part ONE: E( X^2 ) 
+          diff_in_mean_squares_wght = diff_in_mean_by_m %>% 
+            mutate_at( sVars2test, funs( . * . ) )       %>%  ### square selected variables
+            mutate_at( sVars2test,  funs( . * nobs ) )   %>%  ### multiply them by weights
+            summarise_all( funs( sum ) )                %>%  ### compute weighted sum 
+            mutate_all( ., funs( ./ nobs ) )            %>%  ### divide by the total weight
+            mutate( nobs = NULL )                            ### remove weights  
+          
+          ### part TWO: Var(X) = E( X^2 ) - E( X )^2
+          variance_wght = diff_in_mean_squares_wght - diff_in_mean_wght %>% mutate_all( ., funs( . * . ) )
+          ### multiply by the correction factor
+          stdv_wght = variance_wght %>% sqrt %>% mutate_all( ., funs( . * sqrt( opt$M / ( opt$M-1 ) ) ) )
+          
+          tstat_wght = diff_in_mean_wght / stdv_wght
+          ### OPTION 1: ### END ### COMPUTE WEIGHTED T-STAT BY BLAND/KERRY (1998)
+          
+          
+          ### OPTION 2: ### BEG ### COMPUTE WEIGHTED T-STAT BY BECKER, EGGER, VON EHRLIG (2012)
+          ### T-STAT FROM TWO-SAMPLE T-TEST APPLIED TO EACH BLOCK M IN A GIVEN TREATMENT GROUP
+          tstat_by_m = do.call( cbind, lapply( sum_test_group_k, `[[`, "tstat") ) %>% 
+                       as.data.frame %>% 
+                       set_rownames( rownames( sum_test_group_k[[1]] ) ) %>% 
+                       t %>%
+                       set_rownames( paste( "m(GPS) =", seq(1,opt$M) ) ) %>%
+                       as.data.frame
+          
+          ### WEIGHT T-STAT FROM EACH BLOCK BY TOTAL NUMBER OF OBSERVATIONS IN EACH BLOCK
+          tstat_wght_beve = tstat_by_m  %>% 
+                            mutate( nobs = df_nobs$nobs_group_k_by_m ) %>%
+                            mutate_at( sVars2test, funs( . * nobs ) )  %>% 
+                            summarise_all( funs(sum) ) %>%
+                            mutate_all( ., funs( ./ nobs ) ) %>%
+                            mutate( nobs = NULL ) 
+          tstat_wght_beve
+          ### OPTION 2: ### END ### COMPUTE WEIGHTED T-STAT BY BECKER, EGGER, VON EHRLIG (2012)
+      
+          stdv_by_m = do.call( cbind, lapply( sum_test_group_k, `[[`, "se") ) %>% 
+            as.data.frame %>% 
+            set_rownames( rownames( sum_test_group_k[[1]] ) ) %>% 
+            t %>% 
+            as.data.frame %>% 
+            set_rownames( paste( "m(GPS) =", seq(1,opt$M) ) ) 
+          stdv_by_m
+          
+          list( nobs = df_nobs, gps_quantile = gps_quantile, 
+                diff_in_mean_by_m = diff_in_mean_by_m, stdv_by_m = stdv_by_m, tstat_by_m = tstat_by_m,
+                diff_in_mean_wght = diff_in_mean_wght, stdv_wght = stdv_wght, tstat_wght = tstat_wght, 
+                tstat_wght_beve = tstat_wght_beve, gps_at_med_dose_group_k = db_coba_k$gps_at_med_dose_group_k )
+      })
+      
+      ### collect number of observations for each group and m-splits
+      nobs_by_m_4tbl_colnames = paste0( c( "","","~" ), paste0( rep( seq(1:opt$dose_group_num), each = opt$dose_group_num ), c( ":(Total)","","" ) ) )
+      
+      nobs_by_m_4tbl = do.call( cbind, lapply( coba_agps_sum, `[[`,  "nobs" ) ) %>%
+                 set_colnames( nobs_by_m_4tbl_colnames )
+      
+      gps_quantile_dose_group_k = do.call( cbind, lapply( coba_agps_sum, `[[`,  "gps_quantile" ) ) %>%
+                 set_colnames( opt$dose_group_names ) %>%
+                 set_rownames( c("", paste( "m(GPS) =", seq(1,opt$M) ) ) ) 
+      
+      ### collect GPS evaluated at the representative point of each treatment interval
+      gps_at_med_dose_group_k = do.call( cbind, lapply( coba_agps_sum, `[[`,  "gps_at_med_dose_group_k" ) )
+      
+      gps_summary_4tbl = apply( gps_at_med_dose_group_k, 2, summary ) %>% set_colnames( opt$dose_group_names ) %>% t
+      
+      diff_in_mean_wght_4tbl = lapply( coba_agps_sum, `[[`,  "diff_in_mean_wght" ) %>%
+                      do.call( rbind, .) %>%
+                      t %>% set_colnames( opt$dose_group_names )
+      
+      diff_in_mean_wght_4tbl
+      
+      diff_in_mean_wght_stdv_4tbl = lapply( coba_agps_sum, `[[`,  "stdv_wght" ) %>%
+                      do.call( rbind, .) %>%
+                      t %>% set_colnames( opt$dose_group_names )
+      
+      diff_in_mean_wght_stdv_4tbl
+     
+      diff_in_mean_by_m_4tbl = lapply( coba_agps_sum, `[[`,  "diff_in_mean_by_m" ) %>%
+                               set_names( opt$dose_group_names ) %>%
+                               do.call( rbind, . )
+      
+      stdv_by_m_4tbl = lapply( coba_agps_sum, `[[`,  "stdv_by_m" ) %>%
+                       set_names( opt$dose_group_names ) %>%
+                       do.call( rbind, . )
+      
+      tstat_by_m_4tbl = lapply( coba_agps_sum, `[[`,  "tstat_by_m" ) %>%
+                        set_names( opt$dose_group_names ) %>%
+                        do.call( rbind, . )
+      
+      tstat_wght_4tbl = lapply( coba_agps_sum, `[[`,  "tstat_wght" ) %>%
+                           set_names( opt$dose_group_names ) %>%
+                           do.call( rbind.data.frame, . ) %>%
+                           t
+      tstat_wght_4tbl
+      
+      tstat_wght_beve_4tbl = lapply( coba_agps_sum, `[[`,  "tstat_wght_beve" ) %>%
+                           set_names( opt$dose_group_names ) %>%
+                           do.call( rbind.data.frame, . ) %>%
+                           t
+      
+      tstat_wght_beve_4tbl
+      
+      list( nobs = nobs_by_m_4tbl, gps_summary = gps_summary_4tbl, gps_quantiles = gps_quantile_dose_group_k,
+            diff_in_mean_by_m = diff_in_mean_by_m_4tbl, stdv_by_m = stdv_by_m_4tbl, tstat_by_m = tstat_by_m_4tbl,
+            diff_in_mean_wght = diff_in_mean_wght_4tbl, diff_in_mean_wght_stdv = diff_in_mean_wght_stdv_4tbl, tstat_wght = tstat_wght_4tbl, 
+            tstat_wght_beve = tstat_wght_beve_4tbl )
+}
+func_check_covariate_balance_flores = function( formula_ols_dose, sGPS_var, db ){ 
+
+      sFormula_X     = formula_ols_dose 
+      sFormula_X_GPS = update(formula_ols_dose, paste("~ . +", paste( sGPS_var, collapse = "+") ))
+      sFormula_GPS   = update( as.formula( paste( opt$varname_dose, "incpt - 1", sep = "~" ) ), paste("~ . +", paste( sGPS_var, collapse = "+") ) )
+      
+      
+      ols_X     = lm( sFormula_X    , data = db ); # summary( ols_X ) 
+      ols_X_GPS = lm( sFormula_X_GPS, data = db ); # summary( ols_X_GPS ) 
+      ols_GPS   = lm( sFormula_GPS  , data = db ); # summary( ols_GPS )
+      
+      lrtest_gps = lrtest( ols_X_GPS, ols_X   ) # test omission of GPS terms
+      lrtest_x   = lrtest( ols_X_GPS, ols_GPS ) # test omission of covariates
+      
+      
+      tbl_lrtest_gps = c( lrtest_gps$LogLik, na.omit( abs( lrtest_gps$Df ) ), na.omit( lrtest_gps$Chisq ) %>% as.numeric, na.omit( lrtest_gps$`Pr(>Chisq)` ) %>% as.numeric ) %>% set_names( c( "Loglik: unrestricted", "Loglik: restricted", "# df", "Chi^2 stat.", "p-value") )
+      
+      tbl_lrtest_x   = c( lrtest_x$LogLik, na.omit( abs( lrtest_x$Df ) ), na.omit( lrtest_x$Chisq ) %>% as.numeric, na.omit( lrtest_x$`Pr(>Chisq)` ) %>% as.numeric ) %>% set_names( c( "Loglik: unrestricted", "Loglik: restricted", "# df", "Chi^2 stat.", "p-value") )
+      
+      tbl_lrtest = rbind( tbl_lrtest_gps, tbl_lrtest_x ) %>%
+                   set_rownames( c( "Omission of GPS terms", "Omission of covariates"))
+      list( LRtest_tbl = tbl_lrtest, ols_X = ols_X, ols_X_GPS = ols_X_GPS, ols_GPS = ols_GPS )  
+}
+func_check_covariate_balance_imaivandyk = function( svar_dose, svar_x_list, db, scale_dose ){
+### regress each covariate X_i on the dose variable T with and without conditioning
+### on the fit from the dose regression E( T | X )
+### NB! for E( log( T ) | X )  use T
+###     for E(      T   | X )  use log( T )
+### see Kluve et al. p598  
+### for dichotomous variables use probit regression
+# svar_x_list = sVars2test; svar_dose = opt$varname_dose_orig; db = db_agps; scale_dose = 100
+  db[[ svar_dose ]] = db[[ svar_dose ]] / scale_dose
+  coba_imai_ud = lapply( svar_x_list, function( sx ) {  # sx = svar_x_list[4]; sx
+  
+    sFormula_X_i     = as.formula( paste(  sx, svar_dose,sep = "~" ) )
+    sFormula_X_i_fit = update( sFormula_X_i, "~ . + fit" )
+  
+    ols_i     = lm( sFormula_X_i    , data = db ); summary( ols_i )
+    ols_i_fit = lm( sFormula_X_i_fit, data = db ); summary( ols_i_fit )
+    
+    ### for dichotomous variables use probit regression
+    if( db[,sx] %>% unique %>% length == 2 ){ 
+  
+       pro_i     = glm( sFormula_X_i    , family = binomial(link = "probit"), data = db )
+       pro_i_fit = glm( sFormula_X_i_fit, family = binomial(link = "probit"), data = db )
+    
+       c( summary( pro_i )$coefficients[ svar_dose, ], summary( pro_i_fit )$coefficients[ svar_dose, ] ) 
+    }
+   
+    c( summary( ols_i )$coefficients[ svar_dose, ], summary( ols_i_fit )$coefficients[ svar_dose, ] )
+    
+  }) %>% do.call( "rbind", . ) %>% set_rownames( svar_x_list )
+  coba_imai_ud
+
+}
+func_check_covariate_balance_kluve      = function( opt, svar_dose, svar_x_list, db, scale_dose ) {
+### regress each covariate X_i on the dose variable T with and without conditioning
+### on the gps values computed at 25th, 50th and 75th percentiles of the dose variable (Kluve et al. p. 598)
+### on the actual gps values as well as gps values computed at 50th percentile of the dose variable (Galagate, p. 92)
+### for dichotomous variables use probit regression
+# svar_x_list = sVars2test; svar_dose = opt$varname_dose_orig; db = db_agps; scale_dose = 100
+  db[[ "dose"     ]] = db[[ svar_dose ]]
+  db[[ "dose_q25" ]] = quantile( db[[ svar_dose ]], 0.25 )
+  db[[ "dose_q50" ]] = quantile( db[[ svar_dose ]], 0.50 )
+  db[[ "dose_q75" ]] = quantile( db[[ svar_dose ]], 0.75 )
+
+
+  db %<>% mutate( dose_q25 = ifelse( opt$ols_dose_log, log( dose_q25 ), dose_q25 ),
+                  dose_q50 = ifelse( opt$ols_dose_log, log( dose_q50 ), dose_q50 ),
+                  dose_q75 = ifelse( opt$ols_dose_log, log( dose_q75 ), dose_q75 ) )  %>%
+          mutate( gps_dose_q25 = compute_gps( dose_q25, fit, sigma ),
+                  gps_dose_q50 = compute_gps( dose_q50, fit, sigma ),
+                  gps_dose_q75 = compute_gps( dose_q75, fit, sigma ) )
+
+   db[[ svar_dose ]] = db[[ svar_dose ]] / scale_dose
+
+  coba_kluve_ud    = lapply( svar_x_list, function( sx ) {  # sx = svar_x_list[1]; sx
+
+    sFormula_X_i     = as.formula( paste(  sx, svar_dose,sep = "~" ) )
+    sFormula_X_i_aux = update( sFormula_X_i, "~ . + gps_dose_q25 + gps_dose_q50 + gps_dose_q75" ); sFormula_X_i_aux
+
+    ols_i     = lm( sFormula_X_i    , data = db ); summary( ols_i )
+    ols_i_aux = lm( sFormula_X_i_aux, data = db ); summary( ols_i_aux )
+
+    ### for dichotomous variables use probit regression
+    if( db[,sx] %>% unique %>% length == 2 ){
+
+       pro_i     = glm( sFormula_X_i    , family = binomial(link = "probit"), data = db )
+       pro_i_aux = glm( sFormula_X_i_aux, family = binomial(link = "probit"), data = db )
+
+       c( summary( pro_i )$coefficients[ svar_dose, ], summary( pro_i_aux )$coefficients[ svar_dose, ] )
+    }
+
+    c( summary( ols_i )$coefficients[ svar_dose, ], summary( ols_i_aux )$coefficients[ svar_dose, ] )
+}) %>% do.call( "rbind", . ) %>% set_rownames( svar_x_list )
+
+  coba_galagate_ud = lapply( svar_x_list, function( sx ) {  # sx = svar_x_list[1]; sx
+
+    sFormula_X_i     = as.formula( paste(  sx, svar_dose,sep = "~" ) )
+    sFormula_X_i_aux = update( sFormula_X_i, "~ . + gps + gps_dose_q50" ); sFormula_X_i_aux
+
+    ols_i     = lm( sFormula_X_i    , data = db ); summary( ols_i )
+    ols_i_aux = lm( sFormula_X_i_aux, data = db ); summary( ols_i_aux )
+
+    ### for dichotomous variables use probit regression
+    if( db[,sx] %>% unique %>% length == 2 ){
+
+       pro_i     = glm( sFormula_X_i    , family = binomial(link = "probit"), data = db )
+       pro_i_aux = glm( sFormula_X_i_aux, family = binomial(link = "probit"), data = db )
+
+       c( summary( pro_i )$coefficients[ svar_dose, ], summary( pro_i_aux )$coefficients[ svar_dose, ] )
+    }
+
+    c( summary( ols_i )$coefficients[ svar_dose, ], summary( ols_i_aux )$coefficients[ svar_dose, ] )
+}) %>% do.call( "rbind", . ) %>% set_rownames( svar_x_list )
+
+  list( coba_kluve_ud = coba_kluve_ud, coba_galagate_ud = coba_galagate_ud )
+}
+
+func_impose_common_support = function( opt, db_cosu, doPlotGPS ){ # db_cosu = db_dose
+### doPlotGPS - option for extracting gps for making historgram plots  
+    ### set the breaks for dose groups
+    # if(  !is.logical( opt$dose_group_breaks_setup$split_by_n ) ){
+    #  n = opt$dose_group_breaks_setup$split_by_n   
+    #  opt$dose_group_breaks = with( db_cosu, quantile( eval( parse( text = opt$varname_dose_orig ) ), probs= seq( 0, n ) / n ) ) 
+    #  ## https://www.r-bloggers.com/converting-a-string-to-a-variable-name-on-the-fly-and-vice-versa-in-r/
+    # } 
+    # if( !is.logical( opt$dose_group_breaks_setup$split_by_breaks ) ){
+    #   breaks = opt$dose_group_breaks_setup$split_by_breaks
+    #   opt$dose_group_breaks = with( db_cosu, c( min( eval( parse( text = opt$varname_dose_orig ) ) ), breaks, max( eval( parse( text = opt$varname_dose_orig ) ) ) ) )
+    #   
+    # } 
+    # opt$dose_group_num    = length( opt$dose_group_breaks ) - 1
+    # opt$dose_group_names = paste0( "dose_group_", seq( 1:opt$dose_group_num ) )
+    
+    db_cosu %<>% mutate( id_dose_group = cut( eval( parse( text = opt$varname_dose_orig ) ), include.lowest = T, labels=1:opt$dose_group_num, breaks = opt$dose_group_breaks ) )
+    
+    ### loop over dose_groups: 
+      ### for each determine CSR
+    
+    cosu_by_group = lapply( seq( 1:opt$dose_group_num ), function( dose_group_k ){ # dose_group_k = 1
+      
+        dose_group_k_med = db_cosu %>% 
+                           filter( id_dose_group == dose_group_k ) %>%
+                           select( !! opt$varname_dose_orig ) %>% 
+                           unlist %>% 
+                           as.numeric %>%
+                           median
+        
+        db_cosu %<>% mutate( dose_med_k = ifelse( opt$ols_dose_log, log( dose_group_k_med ), dose_group_k_med ) )  %>%
+                     mutate( gps_dose_med_k = compute_gps( dose_med_k, fit, sigma ) )
+        
+        db_cosu_k = db_cosu %>%
+                    filter( id_dose_group == dose_group_k ) %>%
+                    select( gps_dose_med_k ) %>%
+                    range
+        
+        db_cosu_j = db_cosu %>%
+                    filter( id_dose_group != dose_group_k ) %>%
+                    select( gps_dose_med_k ) %>%
+                    range
+        
+        cosu_low = max( db_cosu_k[1], db_cosu_j[1] )
+        cosu_top = min( db_cosu_k[2], db_cosu_j[2] )
+        
+        #c( cosu_low, cosu_top )
+        
+        ### whole sample
+        cosu_init = db_cosu %>%
+                     select( id, id_dose_group, gps_dose_med_k ) %>%
+                     mutate( flag_group_k = ifelse( id_dose_group == dose_group_k, TRUE, FALSE ) )
+        
+        ### common support sample
+        cosu_true = db_cosu %>%
+                     filter( gps_dose_med_k >= cosu_low, gps_dose_med_k <= cosu_top ) %>%
+                     select( id, id_dose_group, gps_dose_med_k ) %>%
+                     mutate( flag_group_k = ifelse( id_dose_group == dose_group_k, TRUE, FALSE ) )
+        
+        list( cosu_true_id = cosu_true$id, cosu_init = cosu_init, cosu_true = cosu_true )
+    
+    }) %>%
+        set_names( opt$dose_group_names )
+    
+    ### collect observations in common support for each dose group
+    list_cosu_true_id = lapply( cosu_by_group, `[[`, "cosu_true_id" ) 
+    
+    ### find intersection of observations in common support across all dose groups
+    cosu_true_id = list_cosu_true_id %>% Reduce( intersect, . ) 
+    
+    ### number of observations satisfying common support: in total and in every group
+    cosu_true_nobs = c( cosu_true_id = length(cosu_true_id), lapply( list_cosu_true_id, function( x ) length(x) ) %>% unlist )
+
+    ### extract gps for plots
+    if( doPlotGPS ){
+      
+     # str( cosu_by_group )
+      
+        gps_init_all_groups = lapply( cosu_by_group, `[[`, "cosu_init" )
+        gps_cosu_all_groups_temp = lapply( cosu_by_group, `[[`, "cosu_true" )
+        ### impose common support across all dose groups
+        gps_cosu_all_groups = lapply( gps_cosu_all_groups_temp, function(x) x %>% filter( id %in% cosu_true_id ) )
+
+        list_gps_cosu_plot = list( gps_init_all_groups = gps_init_all_groups, gps_cosu_all_groups = gps_cosu_all_groups )
+        #str( list_gps_cosu_plot )
+    }else{
+        list_gps_cosu_plot = NULL
+    }
+    list( cosu_true_id = cosu_true_id, cosu_true_nobs = cosu_true_nobs, list_gps_cosu_plot = list_gps_cosu_plot )
+}
+func_compute_adrf          = function( opt, ols4predict ){
+### in: ols4predict - lm object
+  adrf = lapply( opt$dose_levels_adrf, function( dose_tau ){ #} dose_tau = 100; ols4predict = ols_resp
+    
+    ### apply log-transform for dose if necessary
+    newdata_dose = ifelse( opt$ols_dose_log, log( dose_tau ), dose_tau )
+    
+    newdata = data.frame( dose_tau, gps = compute_gps( newdata_dose, db_dose$fit, db_dose$sigma), incpt = 1  ) %>%
+              set_colnames( c( opt$varname_dose_orig, "gps", "incpt") )
+    
+    adrf_dose = predict( ols4predict, newdata = newdata )
+    # adrf_dose = predict( ols_cond, newdata = newdata )
+    
+    median( adrf_dose )  
+    
+  }) %>% unlist
+  adrf
+  
+  data.frame( tau = opt$dose_levels_adrf, adrf )
+  
+}
+
+### hacked function from simpleboot R-package
+lm.boot.resample_bbb = function (lm.object, R, rows, new.xpts, weights){
+### added  - bootstrapped response variable to the output
+###        - max likelihood estimate of regression standard error
+    boot.list <- vector("list", length = R)
+    names(boot.list) <- as.character(1:R)
+    yhat <- predict(lm.object)
+    f <- formula(lm.object)
+    mframe <- model.frame(lm.object)
+    nobs <- nrow(mframe)
+    for (i in 1:R) { #R = 1
+        if (rows) {
+            boot.idx <- sample(1:nobs, replace = TRUE, prob = weights)
+            mf <- mframe[boot.idx, ]
+        }
+        else {
+            mf <- model.frame(lm.object)
+            rstar <- sample(residuals(lm.object), replace = TRUE, 
+                prob = weights)
+            mf[[attr(terms(lm.object), "response")]] <- yhat + rstar
+        }
+        rs.lm <- update( lm.object, data = mf )
+        rss <- sum(residuals(rs.lm)^2)
+        y <- mf[[attr(terms(lm.object), "response")]]
+        syy <- sum(y^2)
+        rval <- list(coef = coef(rs.lm), rss = rss, rsquare = (syy - 
+            rss)/syy, rstderr = sqrt(rss/(nobs - rs.lm$rank)), sigma = sqrt( rss/nobs),
+            response_boot = y )
+        if (!is.null(new.xpts)) 
+            rval$fitted <- predict(rs.lm, newdata = new.xpts)
+        boot.list[[i]] <- rval
+    }
+    boot.list
+}
+lm.boot_bbb          = function (lm.object, R, rows = TRUE, new.xpts = NULL, ngrid = 100, weights = NULL){
+### modified original lm.boot to include lm.boot.resample_bbb function
+    orig.data <- model.frame(lm.object)
+    if (ncol(orig.data) == 2 && is.null(new.xpts)) {
+        mask.response <- -attr(terms(lm.object), "response")
+        range.x <- range(orig.data[, mask.response])
+        new.xpts <- data.frame(seq(range.x[1], range.x[2], len = ngrid))
+        names(new.xpts) <- names(orig.data)[mask.response]
+    }
+    if (is.null(weights)) 
+        weights <- rep(1, NROW(orig.data))
+    boot.list <- lm.boot.resample_bbb(lm.object, R, rows, new.xpts, weights)
+    structure(list(method = ifelse(rows, "rows", "residuals"), 
+        boot.list = boot.list, orig.lm = lm.object, new.xpts = new.xpts, 
+        weights = weights), class = "lm.simpleboot_bbb")
+}
+
+func_get_boot_ci = function( y, boot_list, ci_coverage ){ # y = df_doseresponse$adrf; boot_list = adrf_boot_list; ci_coverage = opt$ci_coverage
+  ### compute bootstrap confidence interval for every dose level tau
+  boot_df = boot_list %>% do.call( "rbind", .) %>% 
+            data.frame 
+  boot_sd = apply( boot_df, 2, sd )
+  
+  boot_ci_low = y + qnorm(     ( 1 - ci_coverage ) / 2, mean = 0, sd = 1 ) * boot_sd
+  boot_ci_top = y + qnorm( 1 - ( 1 - ci_coverage ) / 2, mean = 0, sd = 1 ) * boot_sd 
+  
+  list( boot_ci_low = boot_ci_low, boot_ci_top = boot_ci_top )
+}
+
+@
+  
+<<options, include=FALSE, cache=FALSE, echo = FALSE>>=
+opt = list()
+
+### options for ols_dose
+opt$ols_dose_log       = TRUE # FALSE # 
+opt$ols_dose_add_incpt = TRUE # FALSE #
+
+### spefication ols_resp
+opt$varname_dose_orig = "prize"
+opt$varname_dose      = ifelse( opt$ols_dose_log, paste0( opt$varname_dose_orig, "_Ln"), opt$varname_dose_orig )
+opt$ols_dose          = c("agew","ownhs","owncoll","male","tixbot","workthen","yearw","yearm1","yearm2","yearm3","yearm4","yearm5","yearm6")
+
+### options for ols_resp
+opt$ols_resp_log       = FALSE # TRUE  # 
+opt$ols_resp_add_incpt = TRUE  # FALSE #
+
+### spefication ols_resp
+opt$varname_resp_orig = "year6"
+opt$varname_resp      = ifelse( opt$ols_resp_log, paste0( opt$varname_resp_orig, "_Ln"), opt$varname_resp_orig )
+opt$ols_resp          = c( "prize","I(prize^2 / 1000)","gps","I(gps^2)","gps:prize" )
+
+### set number of blocks to test covariate balance
+opt$M = 5
+opt$gps_flores = c("gps", "I(gps^2)", "I(gps^3)")
+opt$scale_dose_coba = 100
+
+opt$tau_step   = 10
+opt$tau_min    = 10
+opt$tau_max    = 100
+opt$dose_levels_adrf = seq( opt$tau_min, opt$tau_max + opt$tau_step, opt$tau_step )
+
+opt$set_seed_boot = 17
+opt$ci_coverage   = 0.95
+@  
+  
+<<data, include=FALSE, cache=FALSE, echo = FALSE>>=
+path = list()
+path$main = "D:/backup/KOF/ArtisEmp/Sandbox/"
+path$data = path$main 
+
+dbname = "LotteryDataSet.dta"
+
+### read data
+db0 = read.dta13( paste0(path$main,dbname) )
+dim( db0 )  
+
+### transform data
+db_init = db0 %>%
+          #mutate( year6 = if_else( is.na( year6 ), 0, year6 - 0.0 ) ) %>%
+          mutate( prize_Ln = log( prize ) ) %>%
+          mutate( year6 = year6 / 1000 )                               %>% 
+          mutate( year6_Ln = ifelse( year6 == 0, year6, log( year6 ) ) ) %>% 
+          mutate( incpt    = 1, id = seq( 1, n() ) ) ; dim( db_init )
+
+###########
+### NB! ### here is the place to remove all the outliers and other suspicious observations
+###########
+
+
+### options for common support and covariance balance
+opt$dose_group_breaks_setup = list( split_by_n = FALSE, split_by_breaks = c( 23, 80 ) ) # list(  split_by_n = 3, split_by_breaks = FALSE ) #  
+opt$impose_common_support   = FALSE # TRUE  # 
+
+if( !is.logical( opt$dose_group_breaks_setup$split_by_n      ) ){
+     n = opt$dose_group_breaks_setup$split_by_n   
+     opt$dose_group_breaks = with( db_init, quantile( eval( parse( text = opt$varname_dose_orig ) ), probs= seq( 0, n ) / n ) ) 
+     ## https://www.r-bloggers.com/converting-a-string-to-a-variable-name-on-the-fly-and-vice-versa-in-r/
+    } 
+if( !is.logical( opt$dose_group_breaks_setup$split_by_breaks ) ){
+      breaks = opt$dose_group_breaks_setup$split_by_breaks
+      opt$dose_group_breaks = with( db_init, c( min( eval( parse( text = opt$varname_dose_orig ) ) ), breaks, max( eval( parse( text = opt$varname_dose_orig ) ) ) ) )
+      
+    } 
+opt$dose_group_num   = length( opt$dose_group_breaks ) - 1
+opt$dose_group_names = paste0( "dose_group_", seq( 1:opt$dose_group_num ) )
+
+
+
+### database for the dose regression
+db_dose = db_init
+
+### database for the commom support restriction
+db_cosu = db_init
+
+### database for the average dose-response regression
+db_ardf = db_init
+@
+
+<<run_main, include=FALSE, cache=FALSE, echo = FALSE>>=
+### STEP ONE: DOSE REGRESSION
+formula_ols_dose = func_set_regression_dose( opt )
+
+ols_dose = lm( formula_ols_dose, data = db_dose ); # 
+ols_dose_summary = summary( ols_dose )
+
+### apply Shapiro-Wilks test of residual normality
+nortest_sw = shapiro.test( ols_dose$residuals )
+
+### compute GPS
+ud_ols_dose = compute_gps_from_ols( ols_dose )
+
+### add gps to db
+db_dose %<>% mutate( gps = ud_ols_dose$gps, fit = ols_dose$fitted.values, sigma = ud_ols_dose$sigma )
+
+### STEP TWO: COMMON SUPPORT RESTRICTION (CSR)
+ud_cosu = func_impose_common_support( opt, db_dose, TRUE )
+
+### STEP TWO-A: TEST COVARIATE BALANCE (INITIAL SAMPLE)
+sVars2test = opt$ols_dose
+coba_init_ud = func_check_covariate_balance_init( opt, db_dose, sVars2test )
+
+### STEP TWO-B: TEST COVARIATE BALANCE (GPS-ADJUSTED SAMPLE) (HIRANO/IMBENS(2004)
+
+if( opt$impose_common_support ){
+  db_agps = db_dose %>% filter( id %in% ud_cosu$cosu_true_id )
+}else{
+  db_agps = db_dose
+}
+
+coba_agps_ud = func_check_covariate_balance_agps( opt, db_agps, sVars2test )
+
+### STEP TWO-C: TEST COVARIATE BALANCE (FLORES ET AL. 2012)
+coba_flores_ud = func_check_covariate_balance_flores( formula_ols_dose, opt$gps_flores, db_agps )
+
+### STEP TWO-D: TEST COVARIATE BALANCE (IMAIvanDYK 2004)
+coba_imai_ud = func_check_covariate_balance_imaivandyk( opt$varname_dose_orig, sVars2test, db_agps, opt$scale_dose_coba )
+
+### STEP TWO-F: TEST COVARIATE BALANCE (KLUVE 2012)
+coba_kluve_orig_ud = func_check_covariate_balance_kluve( opt, opt$varname_dose_orig, sVars2test, db_agps, opt$scale_dose_coba )
+coba_kluve_ud      = func_check_covariate_balance_kluve( opt, opt$varname_dose     , sVars2test, db_agps, 1 )
+
+### STEP TRI: CONDITIONAL REGRESSION
+formula_ols_resp = func_set_regression_resp( opt )
+
+if( opt$impose_common_support ){
+  db_resp = db_dose %>% filter( id %in% ud_cosu$cosu_true_id )
+}else{
+  db_resp = db_dose
+}
+  
+ols_resp = lm( formula_ols_resp, data = db_resp ); # 
+ols_resp_summary = summary( ols_resp ); ols_resp_summary
+
+### STEP FOUR: AVERAGE DOSE-RESPONSE FUNCTION
+df_adrf = func_compute_adrf( opt, ols_resp )
+
+### average treatment effect function ( D y / D tau )
+df_doseresponse = df_adrf %>% 
+                  mutate( atef = ( dplyr::lead( adrf ) - adrf ) /  ( dplyr::lead( tau ) - tau ) ) %>%
+                  na.omit
+
+### STEP FIVE: BOOTSTRAP ADRF
+set.seed( opt$set_seed_boot )
+
+if( opt$ols_dose_log ){
+    db_dose_boot = db_dose %>% mutate( dose = log( db_dose[[ opt$varname_dose_orig ]] ) )
+}else{
+    db_dose_boot = db_dose %>% mutate( dose =      db_dose[[ opt$varname_dose_orig ]]   )
+}
+
+### substitute dependent variable with dose in ols_dose formula
+formula_ols_dose_boot = update( formula_ols_dose, dose ~ . ) 
+
+ols_dose_update = lm( formula_ols_dose_boot, data = db_dose_boot ); summary( ols_dose_update )
+
+### bootstrap dose regression by resampling residuals ( R times )
+ols_dose_boot    = lm.boot_bbb( ols_dose_update, R = 100, rows = FALSE, new.xpts = ols_dose_update$model[,-1] )
+
+### make summary over bootstraped coefficients
+boot_coef_df = lapply( ols_dose_boot$boot.list, `[[`, "coef" ) %>% do.call( "rbind", . )
+boot_coef_summary = rbind( apply( boot_coef_df, 2, mean ), apply( boot_coef_df, 2, sd ) ) %>% set_rownames( c( "mean", "sd" ) )
+
+### loop over bootstraped data
+doseresponse_boot_list = lapply( ols_dose_boot$boot.list, function( boot ){ #boot = ols_dose_boot$boot.list[[1]]
+
+    boot_fitted = boot$fitted
+    boot_sigma  = boot$sigma
+    boot_actual = boot$response_boot
+    
+    ### compute GPS at bootstraped values
+    boot_gps    = compute_gps( boot_actual, boot_fitted, boot_sigma )  
+    
+    db_resp_boot = db_init %>%
+                   mutate( fit = boot_fitted, sigma = boot_sigma, gps = boot_gps ) %>%
+                   mutate( !! opt$varname_dose_orig := NULL ) %>%
+                   mutate( !! opt$varname_dose      := NULL ) 
+    
+    ### add bootstrapped dose variable
+    db_resp_boot %<>% mutate( !! opt$varname_dose := boot_actual )
+    
+    if( opt$ols_dose_log ){
+      db_resp_boot %<>% mutate( !! opt$varname_dose_orig := exp( boot_actual ) )
+    }else{
+      db_resp_boot %<>% mutate( !! opt$varname_dose_orig := boot_actual )
+    }
+
+    
+    ### STEP TWO-BOOT: COMMON SUPPORT RESTRICTION (CSR)
+    if( opt$impose_common_support ){
+     ud_cosu_boot = func_impose_common_support( opt, db_resp_boot, FALSE )
+     db_resp_boot = db_resp_boot %>% filter( id %in% ud_cosu_boot$cosu_true_id )
+    }
+    
+    ### STEP TRI-BOOT: CONDITIONAL REGRESSION
+    ols_resp_boot = lm( formula_ols_resp, data = db_resp_boot ); # 
+    ols_resp_boot_summary = summary( ols_resp_boot ); ols_resp_boot_summary
+
+    ### STEP FOUR: AVERAGE DOSE-RESPONSE FUNCTION
+    df_adrf_boot = func_compute_adrf( opt, ols_resp_boot )
+
+    ### average treatment effect function ( D y / D tau )
+    df_doseresponse_boot = df_adrf_boot %>% 
+                           mutate( atef = ( dplyr::lead( adrf ) - adrf ) /  ( dplyr::lead( tau ) - tau ) ) %>%
+                           na.omit
+    df_doseresponse_boot
+}) 
+
+adrf_boot_list = lapply( doseresponse_boot_list, `[[`, "adrf" )
+atef_boot_list = lapply( doseresponse_boot_list, `[[`, "atef" )
+
+adrf_boot_ci = func_get_boot_ci( df_doseresponse$adrf, adrf_boot_list, opt$ci_coverage )
+atef_boot_ci = func_get_boot_ci( df_doseresponse$atef, atef_boot_list, opt$ci_coverage )
+
+df_doseresponse %<>% mutate( adrf_low = adrf_boot_ci$boot_ci_low, adrf_top = adrf_boot_ci$boot_ci_top ) %>%
+                     mutate( atef_low = atef_boot_ci$boot_ci_low, atef_top = atef_boot_ci$boot_ci_top )
+
+@ 
+  
+  
+<<plot_dens_dose, fig.cap=paste( 'Density of log of prize: ', dim(db_init)[1], ' observations'), fig.pos="H" >>=
+ggplot(db_init, aes( x = prize_Ln ) ) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   binwidth=0.1,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666") 
+@   
+  
+  
+<<plot_dens_resp, fig.cap=paste( 'Density of log of year6: ', dim(db_init)[1], ' observations'), fig.pos="H" >>=
+ggplot(db_init, aes( x = year6_Ln ) ) + 
+    geom_histogram(aes(y=..density..),      # Histogram with density instead of count on y-axis
+                   binwidth=0.1,
+                   colour="black", fill="white") +
+    geom_density(alpha=.2, fill="#FF6666") 
+@   
+    
+  
+<<ols_dose_tbl, results='asis', echo=FALSE>>=
+# kable(summary(ols_dose)$coef, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:stepTwo}Step 2: Conditional regression')%>%
+# kable_styling( font_size = 10, latex_options = "hold_position" ) 
+stargazer(ols_dose, title="Dose regression", type = "latex", align=TRUE, no.space=TRUE, single.row=TRUE,
+omit.stat=c("LL","f","ser") )
+@  
+  
+\clearpage\newpage 
+<<ols_dose_diag, results='asis', echo=FALSE, fig.cap= 'Dose regression: Residual diagnostics', fig.pos="H">>=   
+### autoplot does not function when the dependent variable is a transformation, i.e. like in I( log( prize ) )
+autoplot(ols_dose, label.size = 3)   
+@  
+  
+  
+\clearpage\newpage  
+\section{Covariate balance}
+\subsection{Initial sample}
+When addressing the covariate balance we first split the observations into three groups according to the treatment intensity, size of the prize money. We split the data into \Sexpr{opt$dose_group_num} groups with the breaks defined \Sexpr{opt$dose_group_breaks_setup$split_by_breaks[1]} and \Sexpr{opt$dose_group_breaks_setup$split_by_breaks[2]}. The range of the treatment variables is \Sexpr{ round( min( db_init$prize), digits = 2) } and \Sexpr{round( max( db_init$prize) )}. The results of testing for the covariate balance on the initial data is reported in Table \ref{tab:coba_init}. The entries in the table are the t-statistics from the two-sided t-test for comparison of means in the one treatment group with those in the other treatment groups. The R-command \textit{t.test} was used for this purpose. The results match exactly those reported in \citet[][Table 2, left panel]{HiranoImbens2004}.
+
+
+<<coba_init_nobs_tbl, results='asis', echo=FALSE>>=
+kable( t( coba_init_ud$tbl_nobs ), digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_init_nobs}Number of observations in each treatment group (Initial data)')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+  
+
+<<coba_init_tstat_tbl, results='asis', echo=FALSE>>=
+kable( coba_init_ud$tbl_tstat, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_init}Covariate balance (Initial data)')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+  
+\subsection{GPS-adjusted sample}  
+There are several options to test for the balancing properties of the GPS. One option as suggested in \citet{HiranoImbens2004} is to proceed repeating the following steps for each treatment group. First, we evaluate GPS at the median treatments of that group; the summary statstics of these values is reported in Table \ref{tab:gps_at_med_by_group}. In the first group this is . Then using the computed GPS we split the observations in that group into $M = $ \Sexpr{opt$M} blocks of about equal size, $m = 1,...,M$. The resulting number of observations in each block is reported in Table \ref{tab:nobs_by_m} and the corresponding GPS intervals used for block assignments is shown in Table \ref{tab:gps_by_m}. For example, the GPS breaks for the first group match those reported in \citet{HiranoImbens2004}.
+ 
+<<coba_gps_at_med_by_group_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$gps_summary, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:gps_at_med_by_group}GPS at median treatment intensity by group')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@   
+  
+
+<<coba_nobs_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$nobs, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:nobs_by_m}Number of observations by dose group and block')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@   
+ 
+<<coba_gps_by_m_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$gps_quantiles, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:gps_by_m}GPS blocks by dose group')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@   
+  
+Then we compare means of observations with GPS values falling into each block for the treatment group and those observations from other groups. That is, for each covariate we compute \Sexpr{opt$M} two-sided t-tests according to their assignment to each GPS block $m$. The values of differences in means and the corresponding standard deviations are reported in Tables \ref{tab:diff_in_mean_by_m} and \ref{tab:stdv_by_m}, respectively. For the variable $agew$ we can compare values with those reported in \citet{HiranoImbens2004}. Our values exactly match those reported there for $m=1$ and $m=2$ for the first group (5.5 (S.E. 2.2) and 3.3 (S.E. 5.3), respectively) and are somewhat are close for the remaining blocks. The difference is possibly can be explained by the different number of observations assigned to blocks $m=3,4,5$ as in the original paper: 39 instead of 38 for $m = 3$, 21 instead of 20 for $m = 4$ and 7 instead of 9 for $m = 5$.
+    
+<<coba_agps_diff_by_m_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$diff_in_mean_by_m, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:diff_in_mean_by_m}Difference in means for each block')%>%
+kable_styling( font_size = 7, latex_options = "hold_position" )
+@
+
+
+<<coba_agps_stdv_by_m_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$stdv_by_m, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:stdv_by_m}Standard deviation of mean difference for each block')%>%
+kable_styling( font_size = 7, latex_options = "hold_position" )
+@
+ 
+Next, we can use mean and standard deviations of differences reported in Tables \ref{tab:diff_in_mean_by_m} and \ref{tab:stdv_by_m} for each GPS block to combine for each treatment group using the number of observations in each GPS block (both in treatment and non-treatment groups) as weights, as in 
+\citet{HiranoImbens2004}. Since no further details is given in the original article, we follow \citet{BlandKerry1998} in computing weighted mean and the corresponding standard deviation. The weighted mean is computed as 
+\[
+E(x) \sim \overline{x} = \frac{1}{\sum_{m=1}^M w_m} \sum_{m=1}^M w_m X_m
+\]
+and its variance is computed as $Var(x) = E(x^2) - E(x)^2$ with 
+\[
+E(x^2) \sim \overline{x^2} = \frac{1}{\sum_{m=1}^M w_m} \sum_{m=1}^M w_m X_m^2. 
+\]
+Finally, the computed variance is adjusted by the factor $M/(M-1)$. The weighted mean and its standard deviation computed using the formulas above are reported in Table \ref{tab:wght_diff_blandkerry} and the resulting t-statistics are shown in Table \ref{tab:tstat_blandkerry}.
+<<coba_agps_diff_in_mean_wght_tbl, results='asis', echo=FALSE>>=
+kable( cbind(coba_agps_ud$diff_in_mean_wght, coba_agps_ud$diff_in_mean_wght_stdv), digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:wght_diff_blandkerry}Weighted difference in means, \\citet{BlandKerry1998}')%>%
+kable_styling( font_size = 8, latex_options = "hold_position" )%>%
+add_header_above( c(" " = 1, "Weighted mean" = 3, "Standard deviation" = 3 ) )
+@
+  
+<<coba_agps_tstat_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$tstat_wght, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:tstat_blandkerry}Covariance balance, t-statistics (GPS-adjusted) \\citet{BlandKerry1998}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+
+Another way to aggregate the information from $M$ t-tests is to follow \citet{Becker2012} to computed weighted t-statistics using the total number of observations in each block as weights. The results are reported in Table \ref{tab:tstat_beve}. 
+<<coba_agps_tstat_beve_tbl, results='asis', echo=FALSE>>=
+kable( coba_agps_ud$tstat_wght_beve, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:tstat_beve}Covariance balance, t-statistics (GPS-adjusted) \\citet{Becker2012}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+
+Alternatively, the covariate balance can be checked using approaches advocated in \citet{Flores2012}, \citet{ImaivanDyk2004}, and \citet{Kluve2012}. \citet{Flores2012} suggests regressing the treatment variable on the covariates and functions of the GPS values (GPS, GPS$^2$, GPS$^3$). By conditioning on the function of GPS one can test whether covariate coefficients can be set equal to zero. If the null hypothesis cannot be rejected than it indicates that conditioning on the GPS adequately balances the covariates. The results are shown in Table \ref{tab:coba_flores}.
+<<coba_flores_ud_tbl, results='asis', echo=FALSE>>=
+kable( coba_flores_ud$LRtest_tbl, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_flores}Covariance balance, \\citet{Flores2012}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+
+<<coba_flores_ols_tbl, results='asis', echo=FALSE>>=
+stargazer(coba_flores_ud$ols_X_GPS, coba_flores_ud$ols_X, coba_flores_ud$ols_GPS, title="Covariance balance, \\citet{Flores2012}", type = "latex", align=TRUE, no.space=TRUE, single.row=TRUE,
+omit.stat=c("f","ser") )
+@ 
+
+\citet{ImaivanDyk2004} suggest to compare coefficient estimates and their significance from regressions of the treatment variable on each covariate with and without conditioning on the fitted values from the dose regression, $E\left[dose|X_i\right]$. Depending on whether log-tranform of the treatment variable was use in the dose regression, i.e. $E\left[ T |X_i\right]$ or $E\left[ \log( T ) |X_i\right]$, one should regress each covariate on $\log(T)$ or $T$, respectively, since by construction of the OLS any continuous covariate is conditionally uncorrelated either with $\log(T)$ for $E\left[ \log( T ) |X_i\right]$ or with $T$ for $E\left[ T |X_i\right]$. The results of their testing procedure are reported in Table \ref{tab:coba_imai}.
+
+<<coba_imai_ud_tbl, results='asis', echo=FALSE>>=
+
+kable( coba_imai_ud, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_imai}Covariance balance, \\citet{ImaivanDyk2004}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" ) %>%
+add_header_above( c(" " = 1, "Unconditional" = 4, "Conditional on fit" = 4 ) ) %>%
+add_header_above( c(" " = 1, "Effect of dose" = 8 ) )
+
+@
+
+\citet{Kluve2012} suggest to compare regressions each covariate without and with conditioning on the distribution of the GPS values, evaluated at different values of the treatment variable, e.g. its the 25th, the 50th, and the 75th percentiles, pooled in one regression. \citet{Galagate2016} conditions on the actual GPS values and those evaluated at the median dose value, jointly.
+
+<<coba_kluve_ud_orig_tbl, results='asis', echo=FALSE>>=
+
+kable( coba_kluve_orig_ud$coba_kluve_ud, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_kluve_orig}Covariance balance, \\citet{Kluve2012}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" ) %>%
+add_header_above( c(" " = 1, "Unconditional" = 4, "Conditional on fit" = 4 ) ) %>%
+add_header_above( c(" " = 1, "Effect of dose (orig)" = 8 ) ) %>%
+footnote(general = "Use the dose variable in original form." )  
+
+kable( coba_kluve_orig_ud$coba_galagate_ud, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_galagate_orig}Covariance balance, \\citet{Galagate2016}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" ) %>%
+add_header_above( c(" " = 1, "Unconditional" = 4, "Conditional on fit" = 4 ) ) %>%
+add_header_above( c(" " = 1, "Effect of dose (orig)" = 8 ) ) %>%
+footnote(general = "Use the dose variable in original form." )  
+
+
+@
+
+
+<<coba_kluve_ud_tbl, results='asis', echo=FALSE>>=
+
+kable( coba_kluve_ud$coba_kluve_ud, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_kluve}Covariance balance, \\citet{Kluve2012}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" ) %>%
+add_header_above( c(" " = 1, "Unconditional" = 4, "Conditional on fit" = 4 ) ) %>%
+add_header_above( c(" " = 1, "Effect of dose" = 8 ) )%>%
+footnote(general = "Use the same transformation of the dose variable as in the dose regression" )  
+
+kable( coba_kluve_ud$coba_galagate_ud, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_galagate}Covariance balance, \\citet{Galagate2016}')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" ) %>%
+add_header_above( c(" " = 1, "Unconditional" = 4, "Conditional on fit" = 4 ) ) %>%
+add_header_above( c(" " = 1, "Effect of dose" = 8 ) )%>%
+footnote(general = "Use the same transformation of the dose variable as in the dose regression" )  
+
+@
+
+\clearpage\newpage
+\section{Common sample restriction} 
+The common sample restriction may help improving covariate balance in the way that it ensures that we compare observations that have comparable GPS values across treated and control groups. The common support is defined as intersection of all observations that fall into a common support computed for each treatment group using GPS values calculated at the median value of that treatment group.
+<<cosu_nobs_tbl, results='asis', echo=FALSE>>=
+kable( t( ud_cosu$cosu_true_nobs ), digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:nobs_cosu}Number of observations in common support')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" ) 
+@  
+
+<<comm_supp_dynamo, results='asis', echo=FALSE, include=FALSE>>=   
+
+list_init = ud_cosu[["list_gps_cosu_plot"]][["gps_init_all_groups"]]
+list_cosu = ud_cosu[["list_gps_cosu_plot"]][["gps_cosu_all_groups"]]
+names( list_init )
+
+list_plt = vector("list", length(names( list_init ) ) * 2 ) 
+i_plt = 1
+for( name_dose_group in names( list_init ) ){
+  
+  plt_init = ggplot( list_init[[ name_dose_group ]], aes(x=gps_dose_med_k, fill=flag_group_k) ) +
+            geom_histogram(binwidth=.02, alpha=.5, position="identity") +
+          labs(title= paste0( "Histogram for ", name_dose_group ) ) +
+          labs(x="GPS", y="Count") +
+          xlim(c(0,0.5))
+
+  plt_cosu = ggplot(list_cosu[[ name_dose_group ]], aes(x=gps_dose_med_k, fill=flag_group_k) ) +
+            geom_histogram(binwidth=.02, alpha=.5, position="identity") +
+          labs(title= paste0( "Histogram for ", name_dose_group ) ) +
+          labs(x="GPS", y="Count") +
+          xlim(c(0,0.5))
+  
+  list_plt[[ i_plt ]]   = plt_init
+   
+  list_plt[[ i_plt+1 ]] = plt_cosu
+  
+
+  i_plt = i_plt + 2;
+}
+
+@
+
+<<plot_comm_supp, results='asis', echo=FALSE, fig.cap= 'GPS: w/o and w/ common support restriction', fig.pos="H">>=   
+do.call("grid.arrange", c( list_plt, ncol = 2))
+@
+  
+\clearpage\newpage  
+\section{Conditional regression} 
+The regression of response variable (earnings after six years of winning in the lottery) conditional on both the treatment intesity (the size of prize) and the GPS values is reported in Table XX. It exactly replicates the estimation results in \citet[][Section 6.2]{BiaMattei2008}. The dose-response function and the derived from it the treatment effect function are reported in Figure \ref{fig:drf}. 
+<<ols_resp_tbl, results='asis', echo=FALSE>>=
+# kable(summary(ols_dose)$coef, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:stepTwo}Step 2: Conditional regression')%>%
+# kable_styling( font_size = 10, latex_options = "hold_position" ) 
+stargazer(ols_resp, title="Conditional regression", type = "latex", align=TRUE, no.space=TRUE, single.row=TRUE,
+omit.stat=c("LL","f","ser") )
+@  
+
+<<ols_resp_diag, results='asis', echo=FALSE, fig.cap= 'Conditional rregression: Residual diagnostics', fig.pos="H">>=   
+### autoplot does not function when the dependent variable is a transformation, i.e. like in I( log( prize ) )
+autoplot(ols_resp, label.size = 3)   
+@  
+  
+
+<<plot_doseresp_boot, results='asis', echo=FALSE, fig.cap= '\\label{fig:drf}Dose-response and treatment-effect functions', fig.pos="H">>=   
+
+df_adrf = df_doseresponse %>%
+            select( tau, starts_with( "adrf") )
+
+df_adrf_panel = melt( df_adrf, id.vars = 'tau', variable.name = 'adrf')
+
+plt_adrf_boot = ggplot( df_adrf_panel, aes( tau, value) ) + 
+  geom_line( aes(colour = adrf), size=2 ) + 
+  scale_color_manual( values=c("blue", "red", "red")) + guides(fill=FALSE, color=FALSE)
+
+df_atef = df_doseresponse %>%
+            select( tau, starts_with( "atef") )
+
+df_atef_panel = melt( df_atef, id.vars = 'tau', variable.name = 'atef')
+
+plt_atef_boot = ggplot( df_atef_panel, aes( tau, value) ) + 
+  geom_line( aes(colour = atef), size=2 ) + 
+  scale_color_manual( values=c("blue", "red", "red")) + guides(fill=FALSE, color=FALSE)
+
+grid.arrange( plt_adrf_boot, plt_atef_boot, ncol = 2 )
+@
+
+
+\bibliography{Refe_sandbox}
+\bibliographystyle{chicago}   
+   
+\end{document}
+    
