@@ -99,12 +99,17 @@ knitr::opts_chunk$set( echo = FALSE, warning = FALSE, message = FALSE)
   
  
 <<functions, include=FALSE, cache=FALSE, echo = FALSE>>=  
-compute_gps = function( y, fit, sigma ){
+compute_gps          = function( y, fit, sigma ){
 ### compute GPS for individual unit i
 ### input: y_i - scalar, value of treatment
 ###        fit_i - scalar, fitted value from step 1
 ###        sigma - scalar, regression standard error from step 1
-    return( exp( -( y - fit )**2 / ( 2 * sigma**2 ) ) / ( sqrt( 2 * pi ) * sigma ) )
+    res = y - fit
+    if( any( is.na( sigma ) ) ){
+      return( rep( NA, length( res ) ) )
+    }    else{
+      return( exp( -( res )**2 / ( 2 * sigma**2 ) ) / ( sqrt( 2 * pi ) * sigma ) )
+    }
 }
 compute_gps_from_ols = function( ols ){
 ### input: ols object from lm  
@@ -115,6 +120,22 @@ compute_gps_from_ols = function( ols ){
   ### compute GPS
   return( list( gps = dnorm( ols$residuals, mean = 0, sd = sigma ), sigma = sigma ) )
 }
+compute_gps_from_kde = function( ols ){
+### input: ols object from lm  
+  # use max lik estimator for the regression standard error, sigma
+  # require( ks )
+  res    = ols$residuals
+  fhat   = kde( x = res)
+  gps_kde = predict( fhat, x = fhat$x )
+  sigma  = sqrt( deviance( ols )/( df.residual( ols ) + ols$qr$rank ) )
+  
+  gps_norm = dnorm( res, mean = 0, sd = sigma )
+  
+  df.gps = data.frame( res = res, gps_kde = gps_kde, gps_norm = gps_norm )
+  
+  list( ols_dose_res = res, gps_kde = gps_kde, gps_norm = gps_norm, sigma = sigma, df.gps = df.gps )
+}
+
 func_set_regression_dose   = function( opt ){
   
   ### check whether to add constant 
@@ -188,7 +209,7 @@ func_check_covariate_balance_init = function( opt, db_coba, sVars2test ){
     
     list( tbl_nobs = tbl_nobs, tbl_tstat = tbl_tstat, tbl_pval = tbl_pval, tbl_diff_mu = tbl_diff_mu, tbl_diff_sd = tbl_diff_sd )
 }
-func_check_covariate_balance_agps = function( opt, db_coba, sVars2test){ # db_coba = db_dose
+func_check_covariate_balance_agps = function( opt, db_coba, sVars2test ){ # db_coba = db_dose; sVars2test = opt$ols_dose_coba 
 
       db_coba %<>% mutate( id_dose_group = cut( eval( parse( text = opt$varname_dose_orig ) ), include.lowest = T, labels=1:opt$dose_group_num, breaks = opt$dose_group_breaks ) )
           
@@ -199,11 +220,22 @@ func_check_covariate_balance_agps = function( opt, db_coba, sVars2test){ # db_co
           med_dose_group_k = db_coba %>% 
                              filter( id_dose_group == dose_group_k ) %>% 
                              summarise_at( .vars = opt$varname_dose, .funs = median ) %>% unlist
-      
-          db_coba_k = db_coba %>%  mutate( med_dose_group_k = med_dose_group_k ) 
+          
+          db_coba_k = db_coba %>%  mutate( med_dose_group_k = med_dose_group_k ) %>%
+                                   mutate( res = med_dose_group_k - fit )
           
           ### compute GPS at med_dose_group_k for all entries
-          db_coba_k %<>% mutate( gps_at_med_dose_group_k = compute_gps( med_dose_group_k, fit, sigma ) )
+          if( opt$compute_gps_from_ols){
+            
+            db_coba_k %<>% mutate( gps_at_med_dose_group_k = compute_gps( med_dose_group_k, fit, sigma ) )
+            
+         }else{
+           
+            kde_hat_ols   = kde( x = opt$object_ols_dose$residuals )
+            db_coba_k %<>% mutate( gps_at_med_dose_group_k = predict( kde_hat_ols, x = db_coba_k$res ) )
+            
+          }
+
           
           gps_quantile = db_coba_k %>% filter( id_dose_group == dose_group_k ) %>% 
                    summarise( list( quantile( gps_at_med_dose_group_k, probs = seq( 0, 1, by = 1/opt$M ) ) ) )%>%
@@ -370,8 +402,10 @@ func_check_covariate_balance_agps = function( opt, db_coba, sVars2test){ # db_co
                  set_colnames( opt$dose_group_names ) %>%
                  set_rownames( c("", paste( "m(GPS) =", seq(1,opt$M) ) ) ) 
       
-      ### collect GPS evaluated at the representative point of each treatment interval
+      ### collect GPS evaluated at the representative point of each treatment interval NB!!! SOMETHING IS WRONG HERE
       gps_at_med_dose_group_k = do.call( cbind, lapply( coba_agps_sum, `[[`,  "gps_at_med_dose_group_k" ) )
+      
+      gps_at_med_dose_group_k %>% head
       
       gps_summary_4tbl = apply( gps_at_med_dose_group_k, 2, summary ) %>% set_colnames( opt$dose_group_names ) %>% t
       
@@ -417,7 +451,7 @@ func_check_covariate_balance_agps = function( opt, db_coba, sVars2test){ # db_co
             diff_in_mean_wght = diff_in_mean_wght_4tbl, diff_in_mean_wght_stdv = diff_in_mean_wght_stdv_4tbl, tstat_wght = tstat_wght_4tbl, 
             tstat_wght_beve = tstat_wght_beve_4tbl )
 }
-func_check_covariate_balance_flores = function( formula_ols_dose, sGPS_var, db ){ 
+func_check_covariate_balance_flores = function( formula_ols_dose, sGPS_var, db ){
 
       sFormula_X     = formula_ols_dose 
       sFormula_X_GPS = update(formula_ols_dose, paste("~ . +", paste( sGPS_var, collapse = "+") ))
@@ -486,10 +520,25 @@ func_check_covariate_balance_kluve      = function( opt, svar_dose, svar_x_list,
 
   db %<>% mutate( dose_q25 = ifelse( opt$ols_dose_log, log( dose_q25 ), dose_q25 ),
                   dose_q50 = ifelse( opt$ols_dose_log, log( dose_q50 ), dose_q50 ),
-                  dose_q75 = ifelse( opt$ols_dose_log, log( dose_q75 ), dose_q75 ) )  %>%
-          mutate( gps_dose_q25 = compute_gps( dose_q25, fit, sigma ),
-                  gps_dose_q50 = compute_gps( dose_q50, fit, sigma ),
-                  gps_dose_q75 = compute_gps( dose_q75, fit, sigma ) )
+                  dose_q75 = ifelse( opt$ols_dose_log, log( dose_q75 ), dose_q75 ) )
+  
+  if( opt$compute_gps_from_ols ){
+      
+    db %<>% mutate( gps_dose_q25 = compute_gps( dose_q25, fit, sigma ),
+                    gps_dose_q50 = compute_gps( dose_q50, fit, sigma ),
+                    gps_dose_q75 = compute_gps( dose_q75, fit, sigma ) )    
+    
+  }else{
+    db %<>% mutate( res_q25 = dose_q25 - fit,
+                    res_q50 = dose_q50 - fit,
+                    res_q75 = dose_q75 - fit )  
+    kde_hat_ols   = kde( x = opt$object_ols_dose$residuals )
+    db %<>% mutate( gps_dose_q25 = predict( kde_hat_ols, x = db$res_q25 ),
+                    gps_dose_q50 = predict( kde_hat_ols, x = db$res_q50 ),
+                    gps_dose_q75 = predict( kde_hat_ols, x = db$res_q75 ) )
+    
+  }
+
 
    db[[ svar_dose ]] = db[[ svar_dose ]] / scale_dose
 
@@ -536,7 +585,7 @@ func_check_covariate_balance_kluve      = function( opt, svar_dose, svar_x_list,
   list( coba_kluve_ud = coba_kluve_ud, coba_galagate_ud = coba_galagate_ud )
 }
 
-func_impose_common_support = function( opt, db_cosu, doPlotGPS ){ # db_cosu = db_dose
+func_impose_common_support = function( opt, db_cosu, doPlotGPS ){ # db_cosu = db_dose; doPlotGPS = TRUE
 ### doPlotGPS - option for extracting gps for making historgram plots  
     ### set the breaks for dose groups
     # if(  !is.logical( opt$dose_group_breaks_setup$split_by_n ) ){
@@ -566,9 +615,20 @@ func_impose_common_support = function( opt, db_cosu, doPlotGPS ){ # db_cosu = db
                            as.numeric %>%
                            median
         
-        db_cosu %<>% mutate( dose_med_k = ifelse( opt$ols_dose_log, log( dose_group_k_med ), dose_group_k_med ) )  %>%
-                     mutate( gps_dose_med_k = compute_gps( dose_med_k, fit, sigma ) )
+        db_cosu %<>% mutate( dose_med_k = ifelse( opt$ols_dose_log, log( dose_group_k_med ), dose_group_k_med ) )
         
+        if( opt$compute_gps_from_ols ){
+          
+            db_cosu %<>% mutate( gps_dose_med_k = compute_gps( dose_med_k, fit, sigma ) )          
+          
+        }else{
+          
+            kde_hat_ols   = kde( x = opt$object_ols_dose$residuals )
+            db_cosu %<>% mutate( res = dose_med_k - fit ) 
+            db_cosu %<>% mutate( gps_dose_med_k = predict( kde_hat_ols, x = db_cosu$res ) )
+           
+        }
+
         db_cosu_k = db_cosu %>%
                     filter( id_dose_group == dose_group_k ) %>%
                     select( gps_dose_med_k ) %>%
@@ -626,14 +686,21 @@ func_impose_common_support = function( opt, db_cosu, doPlotGPS ){ # db_cosu = db
     }
     list( cosu_true_id = cosu_true_id, cosu_true_nobs = cosu_true_nobs, list_gps_cosu_plot = list_gps_cosu_plot )
 }
-func_compute_adrf          = function( opt, ols4predict ){
+func_compute_adrf          = function( opt, ols4predict ){ # ols4predict = ols_resp
 ### in: ols4predict - lm object
-  adrf = lapply( opt$dose_levels_adrf, function( dose_tau ){ #} dose_tau = 100; ols4predict = ols_resp
+  adrf = lapply( opt$dose_levels_adrf, function( dose_tau ){ #} dose_tau = opt$dose_levels_adrf[4]; ols4predict = ols_resp
     
     ### apply log-transform for dose if necessary
     newdata_dose = ifelse( opt$ols_dose_log, log( dose_tau ), dose_tau )
     
-    newdata = data.frame( dose_tau, gps = compute_gps( newdata_dose, db_dose$fit, db_dose$sigma), incpt = 1  ) %>%
+    if( opt$compute_gps_from_ols ){
+        gps = compute_gps( newdata_dose, db_dose$fit, db_dose$sigma)
+    }else{
+        kde_hat_ols   = kde( x = opt$object_ols_dose$residuals )
+        gps = predict( kde_hat_ols, x = newdata_dose - db_dose$fit )
+    }
+      
+    newdata = data.frame( dose_tau, gps = gps, incpt = 1  ) %>%
               set_colnames( c( opt$varname_dose_orig, "gps", "incpt") )
     
     adrf_dose = predict( ols4predict, newdata = newdata )
@@ -831,12 +898,11 @@ grid.arrange( plt_rdi_Ln, plt_empl_Ln, ncol = 2 )
 <<options, include=FALSE, cache=FALSE, echo = FALSE>>=
 opt = list()
 
-#opt$compute_gps_from_ols = FALSE
+opt$compute_gps_from_ols = FALSE # TRUE # 
 
 ### options for ols_dose
 opt$ols_dose_log       = TRUE # FALSE # 
 opt$ols_dose_add_incpt = TRUE # FALSE #
-opt$
 
 ### spefication ols_resp
 opt$varname_dose_orig = "rdi"
@@ -845,7 +911,7 @@ opt$ols_dose          = c( "capex_Ln","capex_Ln2",
                            "mcap_Ln" ,"mcap_Ln2",
                            "op_ln_pos","op_ln2_pos",
                            "op_ln_neg","op_ln2_neg",
-                           "country","sector","country*tech") #"country","sector") # "capex_Ln*tech","mcap_Ln*tech",
+                           "country","sector","country*tech") #,"tech""country","sector") # "capex_Ln*tech","mcap_Ln*tech",
 
 # opt$ols_dose          = c( "I(log(capex))","I(log(capex)^2 / 10)",
 #                            "I(log(mcap))" ,"I(log(mcap)^2  / 10)",
@@ -865,6 +931,14 @@ opt$varname_resp_orig = "empl_Ln"
 opt$varname_resp      = ifelse( opt$ols_resp_log, paste0( opt$varname_resp_orig, "_Ln"), opt$varname_resp_orig )
 # opt$ols_resp          = c( "log(rdi)","gps","I(gps^3 * 10 )","I(gps * log(rdi))" )
  opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","gps","I(gps * log(rdi))" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","gps" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","I(log(gps))" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","I(log(gps))","I(log(gps)*log(rdi))" )
+#opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","I(log(gps))","I(log(gps)^2)" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","gps","I(gps * log(rdi))","I(gps * log(rdi)^2)" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","gps","I(gps * log(rdi))","I(gps * log(rdi)^2)","I(gps * log(rdi)^3)" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","I(log(rdi)^3)","I(log(rdi)^4)","gps","I(gps * log(rdi))" )
+# opt$ols_resp          = c( "log(rdi)","I(log(rdi)^2)","gps","I(gps * log(rdi))" )
 # opt$ols_resp          = c( "log(rdi)","gps" )
 
 
@@ -953,25 +1027,27 @@ formula_ols_dose = func_set_regression_dose( opt )
 
 ols_dose = lm( formula_ols_dose, data = db_dose ); # 
 ols_dose_summary = summary( ols_dose )
-
-
-
+opt$object_ols_dose = ols_dose
 
 ### apply Shapiro-Wilks test of residual normality
 nortest_sw = shapiro.test( ols_dose$residuals )
 
-### compute GPS
-ud_ols_dose = compute_gps_from_ols( ols_dose )
+### compute GPS and add to db
 
-### add gps to db
-db_dose %<>% mutate( gps = ud_ols_dose$gps, fit = ols_dose$fitted.values, sigma = ud_ols_dose$sigma )
+if( opt$compute_gps_from_ols ){
+  ud_ols_dose = compute_gps_from_ols( ols_dose )
+  db_dose %<>% mutate( gps = ud_ols_dose$gps, fit = ols_dose$fitted.values, sigma = ud_ols_dose$sigma )
+}else{
+  ud_ols_dose = compute_gps_from_kde( ols_dose )
+  db_dose %<>% mutate( gps = ud_ols_dose$gps_kde, fit = ols_dose$fitted.values, sigma = NA )
+}
+
 
 ### STEP TWO: COMMON SUPPORT RESTRICTION (CSR)
 ud_cosu = func_impose_common_support( opt, db_dose, TRUE )
 
 
 ### STEP TWO-A: TEST COVARIATE BALANCE (INITIAL SAMPLE)
-
 coba_init_ud = func_check_covariate_balance_init( opt, db_dose, opt$ols_dose_coba )
 
 
@@ -1060,12 +1136,18 @@ boot_coef_summary = rbind( apply( boot_coef_df, 2, mean ), apply( boot_coef_df, 
 doseresponse_boot_list = lapply( ols_dose_boot$boot.list, function( boot ){ #boot = ols_dose_boot$boot.list[[2]]
 
     boot_fitted = boot$fitted
-    boot_sigma  = boot$sigma
+    boot_sigma  = ifelse( opt$compute_gps_from_ols, boot$sigma, NA ) 
     boot_actual = boot$response_boot
     
     ### compute GPS at bootstraped values
-    boot_gps    = compute_gps( boot_actual, boot_fitted, boot_sigma )  
-    
+    if( opt$compute_gps_from_ols ){
+        boot_gps    = compute_gps( boot_actual, boot_fitted, boot_sigma )  
+    }else{
+        boot_res = boot_actual - boot_fitted
+        fhat     = kde( x = boot_res)
+        boot_gps = predict( fhat, x = fhat$x )
+    }
+
     db_resp_boot = db_init %>%
                    mutate( fit = boot_fitted, sigma = boot_sigma, gps = boot_gps ) %>%
                    mutate( !! opt$varname_dose_orig := NULL ) %>%
@@ -1083,7 +1165,7 @@ doseresponse_boot_list = lapply( ols_dose_boot$boot.list, function( boot ){ #boo
     
     ### STEP TWO-BOOT: COMMON SUPPORT RESTRICTION (CSR)
     if( opt$impose_common_support ){
-     ud_cosu_boot = func_impose_common_support( opt, db_resp_boot, FALSE )
+     ud_cosu_boot = func_impose_common_support( opt, db_resp_boot, FALSE ) ### HERE IS WRONG 
      db_resp_boot = db_resp_boot %>% filter( id %in% ud_cosu_boot$cosu_true_id )
     }
     
@@ -1148,7 +1230,15 @@ autoplot(ols_dose, label.size = 3)
   
 <<ols_dose_res_dens, results='asis', echo=FALSE, fig.cap= 'Dose regression: Residual density', fig.pos="H">>=   
 ### autoplot does not function when the dependent variable is a transformation, i.e. like in I( log( prize ) )
-qplot( ols_dose$residuals, geom="histogram")    
+if( opt$compute_gps_from_ols ){
+  qplot( ols_dose$residuals, geom="histogram")    
+}else{
+  ggplot( ud_ols_dose$df.gps ) + 
+    geom_histogram( aes( x=res,y=..density..), position="identity") + 
+    geom_density(   aes( x=res,y=..density..), color = "blue") +
+    geom_line(      aes( x=res, y= gps_kde  ), color = 'red' )+
+    geom_line(      aes( x=res, y= gps_norm ), color = 'yellow' )
+}
 @   
   
 <<cosu_nobs_tbl, results='asis', echo=FALSE>>=
@@ -1197,6 +1287,19 @@ do.call("grid.arrange", c( list_plt, ncol = 2))
 kable( coba_agps_ud$gps_summary, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:gps_at_med_by_group}GPS at median treatment intensity by group')%>%
 kable_styling( font_size = 10, latex_options = "hold_position" )
 @   
+  
+
+<<coba_init_nobs_tbl, results='asis', echo=FALSE>>=
+kable( t( coba_init_ud$tbl_nobs ), digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_init_nobs}Number of observations in each treatment group (Initial data)')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+  
+
+<<coba_init_tstat_tbl, results='asis', echo=FALSE>>=
+kable( coba_init_ud$tbl_tstat, digits=2, format = "latex", booktabs = T, align = "r", caption = '\\label{tab:coba_init}Covariate balance (Initial data)')%>%
+kable_styling( font_size = 10, latex_options = "hold_position" )
+@
+   
   
 
 <<coba_nobs_tbl, results='asis', echo=FALSE>>=
